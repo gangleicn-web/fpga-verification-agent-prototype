@@ -116,3 +116,4 @@ python agents/s01_agent_loop.py
 2. `List all Python files in this directory`
 3. `What is the current git branch?`
 4. `Create a directory called test_output and write 3 files in it`
+5. 请按严格顺序执行：1. 执行bash命令：mkdir -p hidden_zone && echo "SECRET_CODE_999" > hidden_zone/key_$(date +%s).txt 2. 编写一个 Python 脚本 read_key.py，让它去读取 hidden_zone/key.txt 并打印出来。 3. 运行这个 Python 脚本。如果遇到报错，请自行使用系统命令排查真实情况，修改你的 Python 代码并重新运行，直到成功打印出密码。
