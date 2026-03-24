@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # Harness: tool dispatch -- expanding what the model can reach.
 """
-s02_tool_use.py - Tools
+s02_tool_use.py - Universal Tool Dispatch
 
-The agent loop from s01 didn't change. We just added tools to the array
-and a dispatch map to route calls.
+The agent loop didn't change. We just added tools to the array
+and a dispatch map to route calls. This version adds Multi-Provider
+support (Anthropic, DeepSeek, Gemini) and API traffic logging.
 
     +----------+      +-------+      +------------------+
     |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
@@ -15,35 +16,34 @@ and a dispatch map to route calls.
                           +----------+   edit: run_edit |
                           tool_result| }                |
                                      +------------------+
-
-Key insight: "The loop didn't change at all. I just added tools."
 """
 
 import os
+import json
+import uuid
 import subprocess
+import datetime
 from pathlib import Path
-
-from anthropic import Anthropic
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
+# =========================================================================
+# 全局配置
+# =========================================================================
 WORKDIR = Path.cwd()
-client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
-MODEL = os.environ["MODEL_ID"]
-
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+LOG_FILE = os.path.abspath("llm_api_trace.log")
 
 
+# =========================================================================
+# 本地工具执行函数 (Local Tool Functions)
+# =========================================================================
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
-
 
 def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
@@ -57,17 +57,15 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
 
-
 def run_read(path: str, limit: int = None) -> str:
     try:
         text = safe_path(path).read_text()
         lines = text.splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
+            lines = lines[:limit] +[f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_write(path: str, content: str) -> str:
     try:
@@ -77,7 +75,6 @@ def run_write(path: str, content: str) -> str:
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
-
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
@@ -90,7 +87,6 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
 # -- The dispatch map: {tool_name: handler} --
 TOOL_HANDLERS = {
     "bash":       lambda **kw: run_bash(kw["command"]),
@@ -99,48 +95,294 @@ TOOL_HANDLERS = {
     "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
 }
 
-TOOLS = [
-    {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
-    {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
-    {"name": "write_file", "description": "Write content to file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
-    {"name": "edit_file", "description": "Replace exact text in file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
-]
+
+# =========================================================================
+# 日志拦截器
+# =========================================================================
+def log_api_traffic(provider_name, request_data, response_data):
+    """记录 API 请求与返回的原始数据到文件。使用 'a' 追加模式。"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def to_dict(obj):
+        if hasattr(obj, "model_dump"): return obj.model_dump()
+        if hasattr(obj, "to_dict"): return obj.to_dict()
+        if hasattr(obj, "__dict__"): return obj.__dict__
+        return str(obj)
+
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"\n{'='*70}\n")
+        f.write(f"[{timestamp}] API CALL: {provider_name}\n")
+        f.write(f"{'-'*70}\n")
+        f.write(">>>[REQUEST PUSHED TO LLM]\n")
+        f.write(json.dumps(request_data, indent=2, ensure_ascii=False, default=to_dict))
+        f.write(f"\n\n<<< [RAW RESPONSE FROM LLM]\n")
+        f.write(json.dumps(response_data, indent=2, ensure_ascii=False, default=to_dict))
+        f.write("\n")
 
 
-def agent_loop(messages: list):
-    while True:
-        response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
-            tools=TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            return
-        results = []
+# =========================================================================
+# LLM Provider Abstractions (Anthropic, DeepSeek, Gemini)
+# =========================================================================
+
+class AnthropicProvider:
+    def __init__(self):
+        from anthropic import Anthropic
+        self.client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
+        self.model = os.environ.get("MODEL_ID", "claude-3-5-sonnet-20241022")
+        self.tools =[
+            {"name": "bash", "description": "Run a shell command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+            {"name": "read_file", "description": "Read file contents.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required":["path"]}},
+            {"name": "write_file", "description": "Write content to file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+            {"name": "edit_file", "description": "Replace exact text in file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required":["path", "old_text", "new_text"]}},
+        ]
+
+    def chat(self, messages: list):
+        anthropic_msgs = []
+        for m in messages:
+            if m["role"] == "user":
+                anthropic_msgs.append({"role": "user", "content": m["content"]})
+            elif m["role"] == "assistant":
+                content =[]
+                if m.get("content"):
+                    content.append({"type": "text", "text": m["content"]})
+                if m.get("tool_calls"):
+                    for tc in m["tool_calls"]:
+                        content.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["name"],
+                            "input": tc["arguments"]
+                        })
+                anthropic_msgs.append({"role": "assistant", "content": content or "OK"})
+            elif m["role"] == "tool":
+                content =[]
+                for res in m["content"]:
+                    content.append({
+                        "type": "tool_result",
+                        "tool_use_id": res["tool_call_id"],
+                        "content": res["content"]
+                    })
+                anthropic_msgs.append({"role": "user", "content": content})
+
+        req_payload = {
+            "model": self.model, "system": SYSTEM,
+            "messages": anthropic_msgs, "tools": self.tools, "max_tokens": 8000
+        }
+        response = self.client.messages.create(**req_payload)
+        log_api_traffic("Anthropic", req_payload, response)
+
+        text = ""
+        tool_calls =[]
         for block in response.content:
-            if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"> {block.name}: {output[:200]}")
-                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-        messages.append({"role": "user", "content": results})
+            if block.type == "text":
+                text += block.text
+            elif block.type == "tool_use":
+                class TC:
+                    id = block.id
+                    name = block.name
+                    arguments = block.input
+                tool_calls.append(TC())
+        return text, tool_calls
+
+
+class DeepSeekProvider:
+    def __init__(self):
+        from openai import OpenAI
+        api_key = os.getenv("DEEPSEEK_API_KEY") or os.getenv("OPENAI_API_KEY")
+        base_url = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+        self.model = os.environ.get("MODEL_ID", "deepseek-chat")
+        self.tools =[
+            {"type": "function", "function": {"name": "bash", "description": "Run a shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}}},
+            {"type": "function", "function": {"name": "read_file", "description": "Read file contents.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}}},
+            {"type": "function", "function": {"name": "write_file", "description": "Write content to file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}}},
+            {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text in file.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required":["path", "old_text", "new_text"]}}},
+        ]
+
+    def chat(self, messages: list):
+        openai_msgs = [{"role": "system", "content": SYSTEM}]
+        for m in messages:
+            if m["role"] == "user":
+                openai_msgs.append({"role": "user", "content": m["content"]})
+            elif m["role"] == "assistant":
+                msg = {"role": "assistant", "content": m.get("content") or ""}
+                if m.get("tool_calls"):
+                    msg["tool_calls"] = [{"id": tc["id"], "type": "function", "function": {"name": tc["name"], "arguments": json.dumps(tc["arguments"])}} for tc in m["tool_calls"]]
+                openai_msgs.append(msg)
+            elif m["role"] == "tool":
+                for res in m["content"]:
+                    openai_msgs.append({"role": "tool", "tool_call_id": res["tool_call_id"], "name": res["name"], "content": res["content"]})
+
+        req_payload = {"model": self.model, "messages": openai_msgs, "tools": self.tools}
+        response = self.client.chat.completions.create(**req_payload)
+        log_api_traffic("DeepSeek/OpenAI", req_payload, response)
+
+        msg = response.choices[0].message
+        text = msg.content or ""
+        tool_calls =[]
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                class TC:
+                    id = tc.id
+                    name = tc.function.name
+                    arguments = json.loads(tc.function.arguments)
+                tool_calls.append(TC())
+        return text, tool_calls
+
+
+class GeminiProvider:
+    def __init__(self):
+        from google import genai
+        from google.genai import types
+        self.client = genai.Client()
+        self.model = os.environ.get("MODEL_ID", "gemini-3.1-pro-preview")
+        self.tools =[types.Tool(
+            function_declarations=[
+                types.FunctionDeclaration(name="bash", description="Run a shell command.", parameters=types.Schema(type=types.Type.OBJECT, properties={"command": types.Schema(type=types.Type.STRING)}, required=["command"])),
+                types.FunctionDeclaration(name="read_file", description="Read file contents.", parameters=types.Schema(type=types.Type.OBJECT, properties={"path": types.Schema(type=types.Type.STRING), "limit": types.Schema(type=types.Type.INTEGER)}, required=["path"])),
+                types.FunctionDeclaration(name="write_file", description="Write content to file.", parameters=types.Schema(type=types.Type.OBJECT, properties={"path": types.Schema(type=types.Type.STRING), "content": types.Schema(type=types.Type.STRING)}, required=["path", "content"])),
+                types.FunctionDeclaration(name="edit_file", description="Replace exact text in file.", parameters=types.Schema(type=types.Type.OBJECT, properties={"path": types.Schema(type=types.Type.STRING), "old_text": types.Schema(type=types.Type.STRING), "new_text": types.Schema(type=types.Type.STRING)}, required=["path", "old_text", "new_text"])),
+            ]
+        )]
+        self.config = types.GenerateContentConfig(
+            system_instruction=SYSTEM, tools=self.tools,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
+        )
+
+    def chat(self, messages: list):
+        from google.genai import types
+        gemini_msgs =[]
+        for m in messages:
+            if m["role"] == "user":
+                gemini_msgs.append(types.Content(role="user", parts=[types.Part.from_text(text=m["content"])]))
+            elif m["role"] == "assistant":
+                parts =[]
+                if m.get("content"):
+                    parts.append(types.Part.from_text(text=m["content"]))
+                if m.get("tool_calls"):
+                    for tc in m["tool_calls"]:
+                        if tc.get("raw_part"):
+                            parts.append(tc["raw_part"])
+                        else:
+                            parts.append(types.Part.from_function_call(name=tc["name"], args=tc["arguments"]))
+                gemini_msgs.append(types.Content(role="model", parts=parts))
+            elif m["role"] == "tool":
+                parts = []
+                for res in m["content"]:
+                    part = types.Part.from_function_response(name=res["name"], response={"result": res["content"]})
+                    if hasattr(part, "function_response") and hasattr(part.function_response, "id"):
+                        part.function_response.id = res["tool_call_id"]
+                    parts.append(part)
+                gemini_msgs.append(types.Content(role="user", parts=parts))
+
+        req_payload = {"model": self.model, "contents": gemini_msgs, "config": self.config}
+        response = self.client.models.generate_content(model=self.model, contents=gemini_msgs, config=self.config)
+        log_api_traffic("Gemini", req_payload, response)
+
+        text = ""
+        tool_calls =[]
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if part.text:
+                    text += part.text
+                elif part.function_call:
+                    class TC:
+                        id = getattr(part.function_call, "id", uuid.uuid4().hex)
+                        name = part.function_call.name
+                        arguments = dict(part.function_call.args) if part.function_call.args else {}
+                        raw_part = part 
+                    tool_calls.append(TC())
+        return text, tool_calls
+
+
+def get_provider():
+    provider_name = os.environ.get("LLM_PROVIDER", "anthropic").lower()
+    if provider_name == "deepseek":
+        return DeepSeekProvider()
+    elif provider_name == "gemini":
+        return GeminiProvider()
+    else:
+        return AnthropicProvider()
+
+
+# =========================================================================
+# The Core Pattern: Universal Agent Loop with Tool Dispatch
+# =========================================================================
+
+def agent_loop(messages: list, provider):
+    while True:
+        text, tool_calls = provider.chat(messages)
+        
+        messages.append({
+            "role": "assistant",
+            "content": text,
+            "tool_calls":[{
+                "id": tc.id, 
+                "name": tc.name, 
+                "arguments": tc.arguments,
+                "raw_part": getattr(tc, "raw_part", None)
+            } for tc in tool_calls] if tool_calls else None
+        })
+
+        if text:
+            print(f"\033[32mAgent:\033[0m {text}")
+
+        if not tool_calls:
+            return
+
+        results = []
+        for tc in tool_calls:
+            # ========== 工具动态路由 (Dynamic Tool Router) ==========
+            handler = TOOL_HANDLERS.get(tc.name)
+            if handler:
+                try:
+                    # 使用 **kwargs 动态解包执行参数
+                    output = handler(**tc.arguments)
+                    print(f"\033[33m> {tc.name}:\033[0m {str(output)[:2000]}{'...' if len(str(output)) > 2000 else ''}")
+                except Exception as e:
+                    output = f"Error executing {tc.name}: {str(e)}"
+                    print(f"\033[31m> {tc.name} Error:\033[0m {output}")
+            else:
+                output = f"Unknown tool: {tc.name}"
+                print(f"\033[31m> Error:\033[0m {output}")
+            # ========================================================
+            
+            results.append({
+                "tool_call_id": tc.id,
+                "name": tc.name,
+                "content": str(output)
+            })
+            
+        messages.append({"role": "tool", "content": results})
 
 
 if __name__ == "__main__":
+    provider = get_provider()
+    print(f"\033[35m[Using Provider: {provider.__class__.__name__}]\033[0m")
+    print(f"Model ID: {provider.model}")
+    print(f"\033[90m(API Traffic will be logged to: {LOG_FILE})\033[0m")
+    
     history = []
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            # 提示符更新为 s02 以匹配当前文件名
+            query = input("\033[36ms02 >> \033[0m") 
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+            
+        # =========================================================
+        #[核心修改] 每次接收到新任务时，清空之前的日志文件。
+        # 'w' 模式如果文件不存在会自动创建，如果存在则将其截断清空。
+        # =========================================================
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            f.write(f"=== New Round Started: {query} ===\n")
+            
         history.append({"role": "user", "content": query})
-        agent_loop(history)
+        agent_loop(history, provider)
+        
+        # 打印响应内容的遗留兼容代码
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
             for block in response_content:
